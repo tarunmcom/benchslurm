@@ -15,7 +15,7 @@ This directory now contains a Slurm-aware runner, [`vllm_runs_slurm.sh`](/home/t
 From the AAC login node:
 
 ```bash
-ssh tarun_mishra_qle@aac14.amd.com
+ssh <User Name>@<host>
 cd /path/to/this/directory
 cp vllm_runs_slurm.conf my_benchmark.conf
 vim my_benchmark.conf
