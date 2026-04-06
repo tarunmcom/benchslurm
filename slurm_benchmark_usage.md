@@ -9,12 +9,6 @@ This directory now contains a Slurm-aware runner, [`vllm_runs_slurm.sh`](/home/t
 5. Run `vllm bench serve` inside the same instance.
 6. Stop the server and the instance when the run completes.
 
-## Files
-
-- [`vllm_runs_slurm.sh`](/home/tarun/run_scr_singularity/vllm_runs_slurm.sh): main runner.
-- [`vllm_runs_slurm.conf`](/home/tarun/run_scr_singularity/vllm_runs_slurm.conf): sample config.
-- [`vllm_runs_slurm_smoke.conf`](/home/tarun/run_scr_singularity/vllm_runs_slurm_smoke.conf): validated 1-GPU smoke-test config.
-- [`manual_benchmarks_guide.md`](/home/tarun/run_scr_singularity/manual_benchmarks_guide.md): manual AAC reference flow.
 
 ## Quick Start
 
