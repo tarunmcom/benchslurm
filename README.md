@@ -12,16 +12,7 @@ This directory now contains a Slurm-aware runner, [`vllm_runs_slurm.sh`](/home/t
 
 ## Quick Start
 
-From the AAC login node:
-
-```bash
-ssh tarun_mishra_qle@aac14.amd.com
-cd /path/to/this/directory
-cp vllm_runs_slurm.conf my_benchmark.conf
-vim my_benchmark.conf
-chmod +x vllm_runs_slurm.sh
-./vllm_runs_slurm.sh -c my_benchmark.conf
-```
+From the AMD Cloud login node:
 
 If you want to skip the confirmation prompt:
 
