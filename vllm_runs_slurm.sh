@@ -35,14 +35,18 @@ SINGULARITY_CACHEDIR_DEFAULT="/var/tmp/${USER}/singularity-cache"
 SINGULARITY_TMPDIR_DEFAULT="/var/tmp/${USER}/singularity-tmp"
 
 SLURM_PARTITION="256C8G1H_MI355X_Ubuntu22"
-SLURM_GPUS=1
+SLURM_GPUS=8
 SLURM_TIME="00:45:00"
 SLURM_MEM="0"
-SLURM_RESERVATION=""
+SLURM_RESERVATION="gpu-24_reservation"
 SLURM_ACCOUNT=""
 SLURM_QOS=""
 SLURM_JOB_NAME="vllm-bench"
 SLURM_EXTRA_ARGS=""
+SLURM_ALLOCATION_MAX_RETRIES=4
+SLURM_ALLOCATION_TIMEOUT_SECS=900
+DIRTY_ALLOCATION_EXIT_CODE=86
+DIRTY_GPU_VRAM_THRESHOLD_BYTES=1073741824
 
 BASE_OUT_DIR="${SCRIPT_DIR}/benchmark_results_slurm"
 RUN_DIR=""
@@ -198,16 +202,6 @@ EXTRA_BENCH_ARGS=""
 
 CONTAINER_IMAGE="docker://rocm/vllm-dev:nightly_main_20260318"
 CONTAINER_INSTANCE_NAME=""
-
-SLURM_PARTITION="256C8G1H_MI355X_Ubuntu22"
-SLURM_GPUS=1
-SLURM_TIME="00:45:00"
-SLURM_MEM="0"
-SLURM_RESERVATION=""
-SLURM_ACCOUNT=""
-SLURM_QOS=""
-SLURM_JOB_NAME="vllm-bench"
-SLURM_EXTRA_ARGS=""
 
 BASE_OUT_DIR="./benchmark_results_slurm"
 EOF
@@ -566,8 +560,10 @@ run_inside_allocation() {
 }
 
 run_through_salloc() {
-  local script_abs config_abs workdir inner_cmd
-  local -a salloc_cmd script_cmd extra_args=()
+  local script_abs config_abs workdir inner_cmd alloc_log probe_cmd
+  local attempt alloc_rc
+  local allocation_granted=false
+  local -a salloc_cmd script_cmd extra_args=() wrapped_cmd=()
 
   command -v salloc >/dev/null 2>&1 || fail "salloc not found on this machine. Run this script from the AAC login node (for example after: ssh tarun_mishra_qle@aac14.amd.com)."
   command -v srun >/dev/null 2>&1 || fail "srun not found on this machine. Run this script from the AAC login node."
@@ -595,15 +591,83 @@ run_through_salloc() {
     inner_cmd+=" --yes"
   fi
   script_cmd=(bash -lc "${inner_cmd}")
+  probe_cmd="$(cat <<EOF
+set -euo pipefail
+
+report_dirty() {
+  printf '[%s] ERROR: Dirty allocation on host %s. %s\n' "\$(date +%H:%M:%S)" "\$(hostname)" "\$1" >&2
+  exit ${DIRTY_ALLOCATION_EXIT_CODE}
+}
+
+dirty_details=""
+
+if command -v lsof >/dev/null 2>&1; then
+  lsof_output="\$(lsof /dev/kfd /dev/dri/renderD* 2>/dev/null || true)"
+  if [[ -n "\${lsof_output}" ]]; then
+    filtered_lsof="\$(awk 'NR == 1 { next } \$1 !~ /^(lsof|srun|bash|sh)\$/ && \$3 !~ /^(root)\$/ { print }' <<< "\${lsof_output}")"
+    if [[ -n "\${filtered_lsof}" ]]; then
+      dirty_details+="GPU device files already open by other processes. "
+      dirty_details+="Details: \$(tr '\n' ';' <<< "\${filtered_lsof}" | sed 's/;*\$//'). "
+    fi
+  fi
+fi
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia_procs="\$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader 2>/dev/null | sed '/^[[:space:]]*\$/d' || true)"
+  if [[ -n "\${nvidia_procs}" ]]; then
+    dirty_details+="nvidia-smi shows active compute processes: \$(tr '\n' ';' <<< "\${nvidia_procs}" | sed 's/;*\$//'). "
+  fi
+  nvidia_mem="\$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null || true)"
+  if [[ -n "\${nvidia_mem}" ]]; then
+    while IFS=, read -r gpu_idx gpu_mem_used; do
+      gpu_idx="\$(xargs <<< "\${gpu_idx:-}")"
+      gpu_mem_used="\$(xargs <<< "\${gpu_mem_used:-0}")"
+      [[ -n "\${gpu_idx}" ]] || continue
+      if [[ "\${gpu_mem_used}" =~ ^[0-9]+$ ]] && (( gpu_mem_used > 256 )); then
+        dirty_details+="GPU \${gpu_idx} already has \${gpu_mem_used} MiB allocated before benchmark start. "
+      fi
+    done <<< "\${nvidia_mem}"
+  fi
+fi
+
+if command -v rocm-smi >/dev/null 2>&1; then
+  rocm_pids="\$(rocm-smi --showpids 2>/dev/null | grep -E '[0-9]+' || true)"
+  if [[ -n "\${rocm_pids}" ]]; then
+    dirty_details+="rocm-smi reports running GPU processes: \$(tr '\n' ';' <<< "\${rocm_pids}" | sed 's/;*\$//'). "
+  fi
+fi
+
+if compgen -G '/sys/class/drm/card*/device/mem_info_vram_used' >/dev/null 2>&1; then
+  while IFS= read -r vram_file; do
+    [[ -r "\${vram_file}" ]] || continue
+    vram_used_bytes="\$(cat "\${vram_file}" 2>/dev/null || echo 0)"
+    gpu_label="\$(basename "\$(dirname "\$(dirname "\${vram_file}")")")"
+    if [[ "\${vram_used_bytes}" =~ ^[0-9]+$ ]] && (( vram_used_bytes > ${DIRTY_GPU_VRAM_THRESHOLD_BYTES} )); then
+      dirty_details+="\${gpu_label} already has \${vram_used_bytes} bytes of VRAM allocated before benchmark start. "
+    fi
+  done < <(printf '%s\n' /sys/class/drm/card*/device/mem_info_vram_used)
+fi
+
+if [[ -n "\${dirty_details}" ]]; then
+  report_dirty "\${dirty_details}"
+fi
+
+exec $(printf '%q ' "${script_cmd[@]}")
+EOF
+)"
 
   salloc_cmd=(salloc
     --job-name "${SLURM_JOB_NAME}"
-    --partition "${SLURM_PARTITION}"
     --exclusive
     --mem "${SLURM_MEM}"
     --gres "gpu:${SLURM_GPUS}"
-    --time "${SLURM_TIME}"
   )
+  if [[ -n "${SLURM_PARTITION}" ]]; then
+    salloc_cmd+=(--partition "${SLURM_PARTITION}")
+  fi
+  if [[ -n "${SLURM_TIME}" ]]; then
+    salloc_cmd+=(--time "${SLURM_TIME}")
+  fi
   if [[ -n "${SLURM_RESERVATION}" ]]; then
     salloc_cmd+=(--reservation "${SLURM_RESERVATION}")
   fi
@@ -621,12 +685,51 @@ run_through_salloc() {
     srun
     --ntasks 1
     --nodes 1
-    "${script_cmd[@]}"
+    bash -lc "${probe_cmd}"
   )
 
-  log "Requesting Slurm allocation from login node"
-  printf '  %s\n' "$(shell_join "${salloc_cmd[@]}")"
-  exec "${salloc_cmd[@]}"
+  alloc_log="$(mktemp "${TMPDIR:-/tmp}/vllm_salloc.XXXXXX.log")"
+  trap 'rm -f "${alloc_log}"' RETURN
+
+  for attempt in $(seq 1 "${SLURM_ALLOCATION_MAX_RETRIES}"); do
+    log "Requesting Slurm allocation from login node (attempt ${attempt}/${SLURM_ALLOCATION_MAX_RETRIES})"
+    printf '  %s\n' "$(shell_join "${salloc_cmd[@]}")"
+
+    wrapped_cmd=("${salloc_cmd[@]}")
+    if command -v timeout >/dev/null 2>&1; then
+      wrapped_cmd=(timeout --foreground "${SLURM_ALLOCATION_TIMEOUT_SECS}s" "${wrapped_cmd[@]}")
+    fi
+
+    set +e
+    "${wrapped_cmd[@]}" 2>&1 | tee "${alloc_log}"
+    alloc_rc=${PIPESTATUS[0]}
+    set -e
+    allocation_granted=false
+    if grep -q "Granted job allocation" "${alloc_log}" 2>/dev/null; then
+      allocation_granted=true
+    fi
+
+    case "${alloc_rc}" in
+      0)
+        return 0
+        ;;
+      "${DIRTY_ALLOCATION_EXIT_CODE}")
+        log "Allocated node failed the cleanliness checks. Releasing it and retrying."
+        tail -n 20 "${alloc_log}" || true
+        ;;
+      124)
+        fail "Timed out waiting ${SLURM_ALLOCATION_TIMEOUT_SECS}s for salloc. This usually means the request is queued too long. Last allocator output: $(tail -n 5 "${alloc_log}" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+        ;;
+      *)
+        if [[ "${allocation_granted}" == "true" ]]; then
+          fail "The benchmark command failed after Slurm allocated a node. Exit code ${alloc_rc}. Last run output: $(tail -n 20 "${alloc_log}" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+        fi
+        fail "Slurm allocation failed with exit code ${alloc_rc}. Last allocator output: $(tail -n 20 "${alloc_log}" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+        ;;
+    esac
+  done
+
+  fail "Unable to get a clean Slurm allocation after ${SLURM_ALLOCATION_MAX_RETRIES} attempts."
 }
 
 confirm_run() {
